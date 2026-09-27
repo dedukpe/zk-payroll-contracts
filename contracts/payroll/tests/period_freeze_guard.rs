@@ -1,23 +1,28 @@
-//! Payroll period freeze guard tests (#471).
+//! Payroll period configuration freeze guard tests (#248).
 //!
-//! Coverage:
-//! - Manual freeze/unfreeze lifecycle with authorization and validation.
-//! - Freeze blocks draft creation, amendment, description updates,
-//!   finalization, and submission for the frozen period.
-//! - Submitting a draft auto-freezes the period (finalized → frozen).
-//! - Cancellation and expiry remain available as escape hatches on a frozen
-//!   period (they remove pending work instead of editing it).
-//! - Failure states expose no salary or employee values — the freeze record
-//!   and events carry only period labels, reasons, and addresses.
+//! Covers: editable periods still accept configuration edits, explicit admin
+//! freezes block further edits, settlement-ready periods are implicitly
+//! frozen, submitting a run freezes the period it was prepared under, and
+//! non-admin freeze attempts are rejected.
 
 #![cfg(test)]
 
-use ::token::Token;
-use payroll::{Payroll, PayrollClient};
+use ::token::{Token, TokenClient};
+use payroll::{Payroll, PayrollClient, PeriodConfigState, SettlementWindowStatus};
 use proof_verifier::{ProofVerifier, ProofVerifierClient, VerificationKey};
 use salary_commitment::{SalaryCommitmentContract, SalaryCommitmentContractClient};
-use soroban_sdk::testutils::{Address as _, Events};
-use soroban_sdk::{Address, BytesN, Env, Symbol, TryIntoVal, Vec};
+use soroban_sdk::testutils::{Address as _, Ledger as _};
+use soroban_sdk::{Address, BytesN, Env, Symbol, Vec};
+
+fn mock_proof(env: &Env) -> BytesN<256> {
+    BytesN::from_array(env, &[0u8; 256])
+}
+
+fn test_nonce(env: &Env, seed: u8) -> BytesN<32> {
+    let mut arr = [0u8; 32];
+    arr[0] = seed;
+    BytesN::from_array(env, &arr)
+}
 
 fn mock_vk(env: &Env) -> VerificationKey {
     VerificationKey {
@@ -37,319 +42,201 @@ fn mock_vk(env: &Env) -> VerificationKey {
     }
 }
 
-fn setup_payroll(env: &Env) -> (PayrollClient<'_>, Address) {
+fn setup_payroll(env: &Env) -> (PayrollClient<'_>, Address, Address, Address, Address) {
     env.mock_all_auths();
+
     let verifier_id = env.register_contract(None, ProofVerifier);
     let verifier_client = ProofVerifierClient::new(env, &verifier_id);
     verifier_client.init_verifier_admin(&Address::generate(env));
     verifier_client.initialize_verifier(&mock_vk(env));
+
     let commitment_id = env.register_contract(None, SalaryCommitmentContract);
     let commitment_client = SalaryCommitmentContractClient::new(env, &commitment_id);
     commitment_client.init_commitment_admin(&Address::generate(env));
+
     let token_id = env.register_contract(None, Token);
+    let token_client = TokenClient::new(env, &token_id);
+
     let payroll_id = env.register_contract(None, Payroll);
     let payroll_client = PayrollClient::new(env, &payroll_id);
+
+    let treasury = Address::generate(env);
     let admin = Address::generate(env);
+    let treasury_owner = Address::generate(env);
+    token_client.mint(&treasury, &1_000_000i128);
+
     payroll_client.initialize(
         &admin,
         &token_id,
         &verifier_id,
         &commitment_id,
-        &Address::generate(env),
-        &Address::generate(env),
+        &treasury,
+        &treasury_owner,
     );
-    (payroll_client, admin)
+
+    commitment_client.set_payroll_operator(&payroll_id);
+
+    let employee = Address::generate(env);
+    commitment_client.store_commitment(&employee, &BytesN::from_array(env, &[0u8; 32]));
+
+    (payroll_client, admin, treasury, treasury_owner, employee)
 }
 
-// ─── Successful path ────────────────────────────────────────────────────────
-
-#[test]
-fn manual_freeze_and_unfreeze_roundtrip() {
-    let env = Env::default();
-    let (payroll, admin) = setup_payroll(&env);
-    let period = Symbol::new(&env, "aug_2026");
-
-    assert!(!payroll.is_period_frozen(&period));
-
-    payroll.freeze_payroll_period(&admin, &period, &Symbol::new(&env, "manual"));
-
-    assert!(payroll.is_period_frozen(&period));
-    let freeze = payroll.get_period_freeze(&period).unwrap();
-    assert_eq!(freeze.period_label, period);
-    assert_eq!(freeze.frozen_by, admin);
-    assert_eq!(freeze.reason, Symbol::new(&env, "manual"));
-
-    payroll.unfreeze_payroll_period(&admin, &period);
-
-    assert!(!payroll.is_period_frozen(&period));
-    assert_eq!(payroll.get_period_freeze(&period), None);
+fn single_payment_batch(
+    env: &Env,
+    employee: &Address,
+    amount: i128,
+) -> (Vec<BytesN<256>>, Vec<i128>, Vec<Address>) {
+    let mut proofs = Vec::new(env);
+    proofs.push_back(mock_proof(env));
+    let mut amounts = Vec::new(env);
+    amounts.push_back(amount);
+    let mut employees = Vec::new(env);
+    employees.push_back(employee.clone());
+    (proofs, amounts, employees)
 }
 
-#[test]
-fn frozen_period_emits_frozen_and_unfrozen_events() {
-    let env = Env::default();
-    let (payroll, admin) = setup_payroll(&env);
-    let period = Symbol::new(&env, "aug_2026");
-
-    let before = env.events().all().len();
-    payroll.freeze_payroll_period(&admin, &period, &Symbol::new(&env, "manual"));
-    let events = env.events().all();
-    let frozen_event = events.get(before).unwrap();
-    let frozen_topic: Symbol = frozen_event.1.get(1).unwrap().try_into_val(&env).unwrap();
-    assert_eq!(frozen_topic, Symbol::new(&env, "period_frozen"));
-    let (emitted_period, frozen_by, reason): (Symbol, Address, Symbol) =
-        frozen_event.2.try_into_val(&env).unwrap();
-    assert_eq!(emitted_period, period);
-    assert_eq!(frozen_by, admin);
-    assert_eq!(reason, Symbol::new(&env, "manual"));
-
-    let before = env.events().all().len();
-    payroll.unfreeze_payroll_period(&admin, &period);
-    let events = env.events().all();
-    let unfrozen_event = events.get(before).unwrap();
-    let unfrozen_topic: Symbol = unfrozen_event.1.get(1).unwrap().try_into_val(&env).unwrap();
-    assert_eq!(unfrozen_topic, Symbol::new(&env, "period_unfrozen"));
-    let (emitted_period, unfrozen_by): (Symbol, Address) =
-        unfrozen_event.2.try_into_val(&env).unwrap();
-    assert_eq!(emitted_period, period);
-    assert_eq!(unfrozen_by, admin);
+fn set_timestamp(env: &Env, ts: u64) {
+    env.ledger().with_mut(|li| {
+        li.timestamp = ts;
+    });
 }
 
-#[test]
-fn unfrozen_period_accepts_new_drafts_again() {
-    let env = Env::default();
-    let (payroll, admin) = setup_payroll(&env);
-    let period = Symbol::new(&env, "aug_2026");
-
-    payroll.freeze_payroll_period(&admin, &period, &Symbol::new(&env, "manual"));
-    payroll.unfreeze_payroll_period(&admin, &period);
-
-    // Authorized correction flow: the period accepts new work again.
-    let draft_id = payroll.create_run_draft(&admin, &5_000i128, &1u32, &period);
-    assert_eq!(payroll.get_run_draft(&draft_id).period_label, period);
-}
-
-// ─── Freeze blocks payroll edits ────────────────────────────────────────────
+const OPEN_AT: u64 = 1_000;
+const EXEC_START: u64 = 2_000;
+const EXEC_END: u64 = 3_000;
+const CLOSE_AT: u64 = 4_000;
 
 #[test]
-#[should_panic(
-    expected = "Payroll period is frozen: it has been finalized and can no longer be edited"
-)]
-fn frozen_period_rejects_draft_creation() {
+fn editable_period_allows_configuration_edits() {
     let env = Env::default();
-    let (payroll, admin) = setup_payroll(&env);
-    let period = Symbol::new(&env, "aug_2026");
-    payroll.freeze_payroll_period(&admin, &period, &Symbol::new(&env, "manual"));
-    payroll.create_run_draft(&admin, &5_000i128, &1u32, &period);
-}
+    let (payroll, admin, _treasury, _owner, _employee) = setup_payroll(&env);
+    let period = Symbol::new(&env, "period_a");
 
-#[test]
-#[should_panic(
-    expected = "Payroll period is frozen: it has been finalized and can no longer be edited"
-)]
-fn frozen_period_rejects_draft_amendment() {
-    let env = Env::default();
-    let (payroll, admin) = setup_payroll(&env);
-    let period = Symbol::new(&env, "aug_2026");
-    let draft_id = payroll.create_run_draft(&admin, &5_000i128, &1u32, &period);
-    payroll.freeze_payroll_period(&admin, &period, &Symbol::new(&env, "manual"));
-    payroll.amend_run_draft(&admin, &draft_id, &9_000i128, &2u32);
-}
+    set_timestamp(&env, OPEN_AT);
+    payroll.open_capacity_period(&admin, &period);
+    payroll.set_settlement_window(&admin, &period, &OPEN_AT, &EXEC_START, &EXEC_END, &CLOSE_AT);
 
-#[test]
-#[should_panic(
-    expected = "Payroll period is frozen: it has been finalized and can no longer be edited"
-)]
-fn frozen_period_rejects_draft_description_update() {
-    let env = Env::default();
-    let (payroll, admin) = setup_payroll(&env);
-    let period = Symbol::new(&env, "aug_2026");
-    let draft_id = payroll.create_run_draft(&admin, &5_000i128, &1u32, &period);
-    payroll.freeze_payroll_period(&admin, &period, &Symbol::new(&env, "manual"));
-    payroll.set_run_draft_description(
+    assert!(!payroll.is_period_config_frozen(&period));
+    assert_eq!(
+        payroll.get_period_config_state(&period),
+        PeriodConfigState::Editable
+    );
+
+    // A second edit while still pre-open succeeds.
+    payroll.set_settlement_window(
         &admin,
-        &draft_id,
-        &soroban_sdk::String::from_str(&env, "corrected figures"),
+        &period,
+        &OPEN_AT,
+        &EXEC_START,
+        &(EXEC_END + 10),
+        &(CLOSE_AT + 10),
     );
-}
-
-#[test]
-#[should_panic(
-    expected = "Payroll period is frozen: it has been finalized and can no longer be edited"
-)]
-fn frozen_period_rejects_draft_finalization() {
-    let env = Env::default();
-    let (payroll, admin) = setup_payroll(&env);
-    let period = Symbol::new(&env, "aug_2026");
-    let draft_id = payroll.create_run_draft(&admin, &5_000i128, &1u32, &period);
-    payroll.freeze_payroll_period(&admin, &period, &Symbol::new(&env, "manual"));
-    payroll.finalize_run_draft(&admin, &draft_id);
-}
-
-#[test]
-#[should_panic(
-    expected = "Payroll period is frozen: it has been finalized and can no longer be edited"
-)]
-fn frozen_period_rejects_draft_submission() {
-    let env = Env::default();
-    let (payroll, admin) = setup_payroll(&env);
-    let period = Symbol::new(&env, "aug_2026");
-    let draft_id = payroll.create_run_draft(&admin, &5_000i128, &1u32, &period);
-    payroll.finalize_run_draft(&admin, &draft_id);
-    payroll.freeze_payroll_period(&admin, &period, &Symbol::new(&env, "manual"));
-    payroll.submit_run_draft(&admin, &draft_id);
-}
-
-// ─── Auto-freeze on submission ──────────────────────────────────────────────
-
-#[test]
-fn submitting_draft_auto_freezes_period() {
-    let env = Env::default();
-    let (payroll, admin) = setup_payroll(&env);
-    let period = Symbol::new(&env, "aug_2026");
-
-    let draft_id = payroll.create_run_draft(&admin, &5_000i128, &1u32, &period);
-    payroll.finalize_run_draft(&admin, &draft_id);
-    assert!(!payroll.is_period_frozen(&period));
-
-    payroll.submit_run_draft(&admin, &draft_id);
-
-    assert!(payroll.is_period_frozen(&period));
-    let freeze = payroll.get_period_freeze(&period).unwrap();
-    assert_eq!(freeze.reason, Symbol::new(&env, "finalized"));
-    assert_eq!(freeze.frozen_by, admin);
-
-    // The freeze is now enforced on every edit path.
-    assert!(payroll
-        .try_create_run_draft(&admin, &5_000i128, &1u32, &period)
-        .is_err());
-    assert!(payroll
-        .try_amend_run_draft(&admin, &draft_id, &9_000i128, &2u32)
-        .is_err());
-}
-
-// ─── Escape hatches stay available ──────────────────────────────────────────
-
-#[test]
-fn frozen_period_allows_cancelling_pending_draft() {
-    let env = Env::default();
-    let (payroll, admin) = setup_payroll(&env);
-    let period = Symbol::new(&env, "aug_2026");
-
-    let draft_id = payroll.create_run_draft(&admin, &5_000i128, &1u32, &period);
-    payroll.freeze_payroll_period(&admin, &period, &Symbol::new(&env, "manual"));
-
-    // Cancellation removes pending work; it must not be blocked by the freeze.
-    payroll.cancel_run_draft(&admin, &draft_id);
     assert_eq!(
-        payroll.get_run_draft(&draft_id).state,
-        payroll::RunDraftState::Cancelled
+        payroll.get_settlement_window_status(&period),
+        Some(SettlementWindowStatus::PreOpen)
     );
+    assert!(!payroll.is_period_config_frozen(&period));
 }
 
 #[test]
-fn frozen_period_allows_expiring_pending_draft() {
+fn explicit_freeze_blocks_further_edits() {
     let env = Env::default();
-    let (payroll, admin) = setup_payroll(&env);
-    let period = Symbol::new(&env, "aug_2026");
+    let (payroll, admin, _treasury, _owner, _employee) = setup_payroll(&env);
+    let period = Symbol::new(&env, "period_b");
 
-    let draft_id = payroll.create_run_draft(&admin, &5_000i128, &1u32, &period);
-    payroll.freeze_payroll_period(&admin, &period, &Symbol::new(&env, "manual"));
+    set_timestamp(&env, OPEN_AT);
+    payroll.open_capacity_period(&admin, &period);
+    payroll.set_settlement_window(&admin, &period, &OPEN_AT, &EXEC_START, &EXEC_END, &CLOSE_AT);
 
-    payroll.expire_run_draft(&admin, &draft_id);
+    payroll.freeze_period_config(&admin, &period);
+
+    assert!(payroll.is_period_config_frozen(&period));
     assert_eq!(
-        payroll.get_run_draft(&draft_id).state,
-        payroll::RunDraftState::Expired
-    );
-}
-
-// ─── Validation and authorization ───────────────────────────────────────────
-
-#[test]
-#[should_panic(expected = "Payroll period is already frozen")]
-fn double_freeze_is_rejected() {
-    let env = Env::default();
-    let (payroll, admin) = setup_payroll(&env);
-    let period = Symbol::new(&env, "aug_2026");
-    payroll.freeze_payroll_period(&admin, &period, &Symbol::new(&env, "manual"));
-    payroll.freeze_payroll_period(&admin, &period, &Symbol::new(&env, "again"));
-}
-
-#[test]
-#[should_panic(expected = "Payroll period is not frozen")]
-fn unfreeze_without_freeze_is_rejected() {
-    let env = Env::default();
-    let (payroll, admin) = setup_payroll(&env);
-    let period = Symbol::new(&env, "aug_2026");
-    payroll.unfreeze_payroll_period(&admin, &period);
-}
-
-#[test]
-#[should_panic(expected = "Unauthorized")]
-fn freeze_requires_admin() {
-    let env = Env::default();
-    let (payroll, admin) = setup_payroll(&env);
-    let period = Symbol::new(&env, "aug_2026");
-    let attacker = Address::generate(&env);
-    assert_ne!(attacker, admin);
-    payroll.freeze_payroll_period(&attacker, &period, &Symbol::new(&env, "manual"));
-}
-
-#[test]
-#[should_panic(expected = "Unauthorized")]
-fn unfreeze_requires_admin() {
-    let env = Env::default();
-    let (payroll, admin) = setup_payroll(&env);
-    let period = Symbol::new(&env, "aug_2026");
-    payroll.freeze_payroll_period(&admin, &period, &Symbol::new(&env, "manual"));
-    let attacker = Address::generate(&env);
-    payroll.unfreeze_payroll_period(&attacker, &period);
-}
-
-#[test]
-fn freeze_rejects_empty_period_label_or_reason() {
-    let env = Env::default();
-    let (payroll, admin) = setup_payroll(&env);
-    let period = Symbol::new(&env, "aug_2026");
-    let empty = Symbol::new(&env, "");
-
-    assert!(payroll
-        .try_freeze_payroll_period(&admin, &empty, &Symbol::new(&env, "manual"))
-        .is_err());
-    assert!(payroll
-        .try_freeze_payroll_period(&admin, &period, &empty)
-        .is_err());
-    // Nothing was frozen by the rejected calls.
-    assert!(!payroll.is_period_frozen(&period));
-}
-
-// ─── Privacy: freeze metadata exposes no salary values ──────────────────────
-
-#[test]
-fn freeze_record_contains_no_salary_or_employee_data() {
-    let env = Env::default();
-    let (payroll, admin) = setup_payroll(&env);
-    let period = Symbol::new(&env, "aug_2026");
-
-    payroll.freeze_payroll_period(&admin, &period, &Symbol::new(&env, "manual"));
-    let freeze = payroll.get_period_freeze(&period).unwrap();
-
-    // The on-chain record only carries the period label, freezer identity,
-    // timestamp, reason label, and the accepted-run count — never amounts or
-    // employee lists. Field-by-field check keeps it that way.
-    let _ = (
-        freeze.period_label,
-        freeze.frozen_by,
-        freeze.frozen_at,
-        freeze.reason,
-        freeze.runs_count,
+        payroll.get_period_config_state(&period),
+        PeriodConfigState::Frozen
     );
 
-    // The freeze event payload must not include i128 amount fields.
-    let events = env.events().all();
-    let event = events.get(events.len() - 1).unwrap();
-    let payload: (Symbol, Address, Symbol) = event.2.try_into_val(&env).unwrap();
-    assert_eq!(payload.0, period);
-    assert_eq!(payload.1, admin);
-    assert_eq!(payload.2, Symbol::new(&env, "manual"));
+    let result = payroll.try_set_settlement_window(
+        &admin,
+        &period,
+        &OPEN_AT,
+        &EXEC_START,
+        &(EXEC_END + 1),
+        &CLOSE_AT,
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn settlement_ready_period_is_implicitly_frozen() {
+    let env = Env::default();
+    let (payroll, admin, _treasury, _owner, _employee) = setup_payroll(&env);
+    let period = Symbol::new(&env, "period_c");
+
+    set_timestamp(&env, OPEN_AT);
+    payroll.open_capacity_period(&admin, &period);
+    payroll.set_settlement_window(&admin, &period, &OPEN_AT, &EXEC_START, &EXEC_END, &CLOSE_AT);
+
+    // Reach the execution window: the period is now settlement-ready.
+    set_timestamp(&env, EXEC_START);
+    assert_eq!(
+        payroll.get_settlement_window_status(&period),
+        Some(SettlementWindowStatus::Executable)
+    );
+    assert!(payroll.is_period_config_frozen(&period));
+    // No explicit freeze marker was recorded.
+    assert_eq!(
+        payroll.get_period_config_state(&period),
+        PeriodConfigState::Editable
+    );
+
+    let result = payroll.try_set_settlement_window(
+        &admin,
+        &period,
+        &OPEN_AT,
+        &(EXEC_START + 1),
+        &EXEC_END,
+        &CLOSE_AT,
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn submitted_run_freezes_period_configuration() {
+    let env = Env::default();
+    let (payroll, admin, _treasury, _owner, employee) = setup_payroll(&env);
+    let period = Symbol::new(&env, "period_d");
+
+    set_timestamp(&env, EXEC_START);
+    payroll.open_capacity_period(&admin, &period);
+    payroll.set_settlement_window(&admin, &period, &OPEN_AT, &EXEC_START, &EXEC_END, &CLOSE_AT);
+
+    let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 10_000);
+    let nonce = test_nonce(&env, 7);
+    let run_id = payroll.prepare_payroll_run(&proofs, &amounts, &employees, &10_000, &nonce, &None);
+    assert!(run_id > 0);
+
+    assert!(payroll.is_period_config_frozen(&period));
+
+    let result = payroll.try_set_settlement_window(
+        &admin,
+        &period,
+        &OPEN_AT,
+        &EXEC_START,
+        &(EXEC_END + 1),
+        &CLOSE_AT,
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn non_admin_cannot_freeze_period() {
+    let env = Env::default();
+    let (payroll, _admin, _treasury, _owner, _employee) = setup_payroll(&env);
+    let period = Symbol::new(&env, "period_e");
+    let stranger = Address::generate(&env);
+
+    let result = payroll.try_freeze_period_config(&stranger, &period);
+    assert!(result.is_err());
 }

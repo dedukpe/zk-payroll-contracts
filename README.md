@@ -110,6 +110,55 @@ payroll_registry.register_company(
 
 ## Usage
 
+### Versioned Admin Configuration Updates
+
+The payroll registry now tracks configuration revisions so off-chain clients can detect changes reliably. Each company maintains a version counter that increments whenever admin or treasury configuration changes.
+
+```rust
+// Get current admin configuration version
+let version = payroll_registry.get_admin_config_version(company_id);
+// Returns: AdminConfigVersion { version: u64, updated_at: u64, updated_by: Address }
+
+// The version automatically increments on admin/treasury rotations
+payroll_registry.propose_admin_rotation(company_id, current_admin, new_admin);
+payroll_registry.accept_admin_rotation(company_id, new_admin);
+// Version now incremented to previous_version + 1
+```
+
+**Key Guarantees:**
+- **Version Tracking**: Each company starts at version 1 when registered
+- **Automatic Incrementing**: Version increments on admin or treasury rotation acceptance
+- **Change Detection**: Off-chain clients can poll the version to detect configuration changes
+- **Event Emission**: `AdminConfigVersionUpdated` events are emitted for reliable change notification
+- **Backward Compatible**: Existing operations continue to work without changes
+
+### Payroll Configuration Audit Events
+
+Every successful configuration change on the `payroll` contract publishes one
+`("payroll", "config_changed", key)` event and bumps a contract-wide revision
+(#490). This covers admin and treasury-owner handoffs, pause manager, asset
+allowlist, company state, capacity limits, settlement windows, period freezes,
+retention policy, reviewers, dispute authorities, reservation expiry, payroll
+currency, and storage version.
+
+```rust
+// data = (actor, subject_ref, previous_ref, new_ref, revision, ledger_sequence, timestamp)
+payroll.set_capacity_limits(&admin, &10, &100, &1_000_000);
+let revision = payroll.get_config_revision(); // 1, 2, 3, ... with no gaps
+```
+
+- **Actor:** the address whose authorization the change required (checked
+  against the stored role).
+- **Value references:** `sha256` of each value's canonical XDR; 32 zero bytes
+  mean "no value". Consecutive changes chain (`previous_ref` = prior
+  `new_ref`).
+- **Privacy:** configuration values are never emitted in plaintext, and no
+  salary, employee, or commitment data is involved.
+- **No-op / failed changes:** no audit event and no revision bump.
+
+See [docs/config-audit-events.md](docs/config-audit-events.md) for the schema,
+key table, and how to verify a reference.
+
 ### Register Employee with Private Salary
 
 ```rust
@@ -141,6 +190,53 @@ payment_executor.process_payment(
     proof
 );
 ```
+
+### Employee Payout Destination Updates
+
+Employees can securely manage and update their payment receiving addresses:
+
+```rust
+// Update payout destination (requires employee authorization)
+payroll_registry.update_payout_destination(
+    company_id,
+    employee_address,
+    new_destination_address
+);
+
+// Update payout destination using wallet string (validates format/checksum)
+payroll_registry.update_payout_destination_wallet(
+    company_id,
+    employee_address,
+    wallet_string
+);
+
+// Retrieve current payout destination (defaults to employee address if unset)
+let destination = payroll_registry.get_payout_destination(company_id, employee_address);
+```
+
+**Key Guarantees:**
+- **Authorization**: Only the employee (`employee.require_auth()`) can modify their own destination.
+- **Validations**: Rejects zero-address (`GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF`), existing duplicate destination on file, or invalid Stellar wallet formatting.
+- **Isolation**: Pending/in-flight payroll runs retain their original snapshot parameters, isolating existing runs from destination updates.
+
+### Bounded Batch Payroll Processing
+
+Process large employee pools across multiple bounded transactions:
+
+```rust
+// Process a bounded batch (up to 50 employees per batch)
+let processed_count = payroll.batch_process_payroll_bounded(
+    company_id,
+    run_id,
+    batch_size // Max 50
+);
+```
+
+**Key Guarantees:**
+- **Hard Cap**: Strictly limits `batch_size <= 50` to prevent gas exhaustion and block limit failures.
+- **Progress Tracking**: Tracks `BatchCheckpoint` state (`processed_count` out of `total_count`). Resumption starts at `last_processed_index` without double payments.
+- **Halt-on-Error**: Halts and rolls back state atomically if any single employee payment or proof fails.
+- **Authorization**: Requires operator/admin authorization (`admin.require_auth()`). Rejects empty batch parameters.
 
 ### Compliance Audit
 

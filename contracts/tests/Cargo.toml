@@ -15,3 +15,11 @@ token = { path = "../token" }
 [[test]]
 name = "liability_invariants"
 path = "liability_invariants.rs"
+
+[[test]]
+name = "onboarding_duplicate_reference"
+path = "onboarding_duplicate_reference.rs"
+
+[[test]]
+name = "draft_updated_timestamp"
+path = "draft_updated_timestamp.rs"

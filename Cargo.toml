@@ -4,6 +4,8 @@ members = [
     "contracts/*",
     "cli",
     "tests/migrations",
+    "tests/audit",
+    "tests/event-ordering",
     "tests/admin",
     "tests/company-state",
     "tests/metadata",
@@ -11,6 +13,8 @@ members = [
     "tests/storage",
     "tests/access-control",
     "tests/events",
+    "tests/disputes",
+    "tests/period-capacity",
     "tests/event_schema",
     "tests/init_matrix",
 ]
@@ -23,8 +27,8 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-soroban-sdk = "21.0.0"
-soroban-token-sdk = "21.0.0"
+soroban-sdk = "28.0.0"
+soroban-token-sdk = "28.0.0"
 
 [profile.release]
 opt-level = "z"

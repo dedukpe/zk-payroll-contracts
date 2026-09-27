@@ -23,7 +23,7 @@
 //! predate this module may use other conventions and are preserved for
 //! backward compatibility.
 
-use soroban_sdk::{symbol_short, Address, BytesN, Env, Symbol};
+use soroban_sdk::{contractevent, symbol_short, Address, BytesN, Env, Symbol};
 
 /// Pause category symbols for event emission.
 /// Defined here to avoid circular dependency with pause_manager.
@@ -79,6 +79,17 @@ pub fn emit_pause_manager_set(e: &Env, pause_manager: Address) {
     e.events().publish(
         (payroll_topic(), Symbol::new(e, "pause_mgr_set")),
         (pause_manager,),
+    );
+}
+
+/// Emitted when an asset is added to or removed from the employer allowlist.
+///
+/// The event contains only the asset address and resulting status; it does not
+/// expose payroll data or other employer-sensitive information.
+pub fn emit_asset_allowlist_updated(e: &Env, asset: Address, allowed: bool) {
+    e.events().publish(
+        (payroll_topic(), Symbol::new(e, "asset_allowlist_updated")),
+        (asset, allowed),
     );
 }
 
@@ -230,6 +241,20 @@ pub fn emit_batch_checkpoint_resumed(
             execution_nonce,
             checkpoint_index,
         ),
+    );
+}
+
+/// Emitted when a completed or failed batch checkpoint is cleaned up.
+pub fn emit_batch_checkpoint_cleaned(
+    e: &Env,
+    employer: Address,
+    batch_root: BytesN<32>,
+    asset: Address,
+    execution_nonce: BytesN<32>,
+) {
+    e.events().publish(
+        (payroll_topic(), Symbol::new(e, "batch_checkpoint_cleaned")),
+        (employer, batch_root, asset, execution_nonce),
     );
 }
 
@@ -620,6 +645,12 @@ pub fn emit_audit_access_revoked(e: &Env, admin: Address, auditor: Address) {
         .publish((Symbol::new(e, "AuditAccessRevoked"), admin, auditor), ());
 }
 
+/// Emitted when an expired audit grant is permanently removed.
+pub fn emit_audit_grant_pruned(e: &Env, admin: Address, auditor: Address) {
+    e.events()
+        .publish((Symbol::new(e, "AuditGrantPruned"), admin, auditor), ());
+}
+
 /// Emitted when an audit commitment verification succeeds.
 pub fn emit_audit_successful(e: &Env, auditor: Address, scope: Symbol) {
     e.events()
@@ -679,6 +710,10 @@ pub fn emit_quorum_consumed(e: &Env, batch_root: BytesN<32>, employer: Address, 
         (batch_root, employer, nonce),
     );
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Versioned Admin Configuration Events
+// ═════════════════════════════════════════════════════════════════════════════
 
 // ═════════════════════════════════════════════════════════════════════════════
 // Compliance Hold Events (#333)
@@ -784,24 +819,99 @@ pub fn emit_draft_expired(e: &Env, draft_id: u64, admin: Address) {
     );
 }
 
-/// Emitted when a prepared payroll run expires before finalization (#474).
-///
-/// `expired_by` is the caller that submitted the expiry transaction
-/// (permissionless). The payload is deliberately redacted: no amounts, no
-/// employee addresses, no commitment material — only identifiers needed to
-/// correlate the expiry with the run's audit trail.
-pub fn emit_run_expired(e: &Env, run_id: u64, expired_by: Address) {
-    e.events().publish(
-        (payroll_topic(), Symbol::new(e, "run_expired")),
-        (run_id, expired_by),
-    );
-}
-
 /// Emitted when a payroll run's reconciliation status is updated.
 pub fn emit_reconciliation_updated(e: &Env, run_id: u64, status: Symbol) {
     e.events().publish(
         (payroll_topic(), Symbol::new(e, "reconciliation_updated")),
         (run_id, status),
+    );
+}
+
+/// Emitted when the employer's per-period capacity policy is set or replaced (#338).
+pub fn emit_capacity_limits_set(
+    e: &Env,
+    max_batches: u32,
+    max_employees: u32,
+    max_total_value: i128,
+) {
+    e.events().publish(
+        (payroll_topic(), Symbol::new(e, "capacity_limits_set")),
+        (max_batches, max_employees, max_total_value),
+    );
+}
+
+/// Emitted when a new payroll period is opened for capacity accounting (#338).
+pub fn emit_capacity_period_opened(e: &Env, period: Symbol) {
+    e.events().publish(
+        (payroll_topic(), Symbol::new(e, "capacity_period_opened")),
+        period,
+    );
+}
+
+/// Emitted after a batch is accepted and its usage recorded against the
+/// active period's capacity counters (#338).
+pub fn emit_capacity_usage_recorded(
+    e: &Env,
+    period: Symbol,
+    batch_count: u32,
+    employee_count: u32,
+    total_value: i128,
+) {
+    e.events().publish(
+        (payroll_topic(), Symbol::new(e, "capacity_usage")),
+        (period, batch_count, employee_count, total_value),
+    );
+}
+
+/// Emitted when a batch is rejected for exceeding a capacity limit. `kind`
+/// identifies the exceeded category: 0 = batch count, 1 = employee count,
+/// 2 = total value (mirrors `payroll::CapacityLimitKind`) (#338).
+pub fn emit_capacity_limit_exceeded(e: &Env, period: Symbol, kind: u32) {
+    e.events().publish(
+        (payroll_topic(), Symbol::new(e, "capacity_exceeded")),
+        (period, kind),
+    );
+}
+
+// ── Issue #316: settlement window enforcement ───────────────────────────────
+
+/// Emitted when an admin sets (or replaces) the settlement window for a
+/// payroll period. Only timing metadata is exposed — no payroll amounts,
+/// commitments, or employee identities (#316).
+pub fn emit_settlement_window_set(
+    e: &Env,
+    period: Symbol,
+    open_at: u64,
+    execution_start: u64,
+    execution_end: u64,
+    close_at: u64,
+) {
+    e.events().publish(
+        (payroll_topic(), Symbol::new(e, "settlement_window_set")),
+        (period, open_at, execution_start, execution_end, close_at),
+    );
+}
+
+/// Emitted when a batch operation is rejected because the period's
+/// settlement window is not currently open for execution. `status` mirrors
+/// `payroll::SettlementWindowStatus` (0 = pre-open, 2 = grace, 3 = closed);
+/// only the timing status is exposed, never payroll amounts (#316).
+pub fn emit_settlement_window_rejected(e: &Env, period: Symbol, status: u32, now: u64) {
+    e.events().publish(
+        (
+            payroll_topic(),
+            Symbol::new(e, "settlement_window_rejected"),
+        ),
+        (period, status, now),
+    );
+}
+
+/// Emitted when a pending payroll run is auto-expired after its period's
+/// settlement window has fully closed (#316).
+pub fn emit_settlement_window_expired(e: &Env, run_id: u64, period: Symbol, expired_at: u64) {
+    e.events().publish(
+        (payroll_topic(), Symbol::new(e, "settlement_window_expired")),
+        (run_id, period, expired_at),
     );
 }
 
@@ -917,6 +1027,124 @@ pub fn emit_run_changes_requested(e: &Env, run_id: u64, reviewer: Address, reaso
     );
 }
 
+/// Emitted when a payroll run's archived on-chain record is permanently pruned (#342).
+pub fn emit_run_pruned(e: &Env, run_id: u64, admin: Address) {
+    e.events().publish(
+        (payroll_topic(), Symbol::new(e, "run_pruned")),
+        (run_id, admin),
+    );
+}
+
+/// Emitted when an eligible retained record is permanently removed.
+pub fn emit_retention_pruned(e: &Env, record_type: Symbol, record_id: u64, admin: Address) {
+    e.events().publish(
+        (payroll_topic(), Symbol::new(e, "retention_pruned")),
+        (record_type, record_id, admin),
+    );
+}
+
+/// Emitted when the administrator changes the retention policy.
+pub fn emit_retention_policy_set(
+    e: &Env,
+    finalized_run_seconds: u64,
+    cancelled_batch_seconds: u64,
+    challenge_seconds: u64,
+) {
+    e.events().publish(
+        (payroll_topic(), Symbol::new(e, "retention_policy_set")),
+        (
+            finalized_run_seconds,
+            cancelled_batch_seconds,
+            challenge_seconds,
+        ),
+    );
+}
+
+/// Emitted when an address is granted dispute-authority permission (#342).
+pub fn emit_dispute_authority_added(e: &Env, authority: Address) {
+    e.events().publish(
+        (payroll_topic(), Symbol::new(e, "dispute_auth_added")),
+        authority,
+    );
+}
+
+/// Emitted when an address has dispute-authority permission revoked (#342).
+pub fn emit_dispute_authority_removed(e: &Env, authority: Address) {
+    e.events().publish(
+        (payroll_topic(), Symbol::new(e, "dispute_auth_removed")),
+        authority,
+    );
+}
+
+/// Emitted when a dispute is opened against a payroll run, freezing its
+/// finalization, archival, and pruning (#342).
+pub fn emit_dispute_opened(
+    e: &Env,
+    dispute_id: u64,
+    run_id: u64,
+    opened_by: Address,
+    period: Symbol,
+    batch_root: BytesN<32>,
+    reason: Symbol,
+) {
+    e.events().publish(
+        (payroll_topic(), Symbol::new(e, "dispute_opened")),
+        (dispute_id, run_id, opened_by, period, batch_root, reason),
+    );
+}
+
+/// Emitted when an active dispute is resolved, thawing the associated run (#342).
+pub fn emit_dispute_resolved(
+    e: &Env,
+    dispute_id: u64,
+    run_id: u64,
+    resolved_by: Address,
+    resolution_reason: Symbol,
+) {
+    e.events().publish(
+        (payroll_topic(), Symbol::new(e, "dispute_resolved")),
+        (dispute_id, run_id, resolved_by, resolution_reason),
+    );
+}
+
+// ── Issue #490: payroll configuration audit events ──────────────────────────
+
+/// Emitted by the Payroll contract once per successful configuration change
+/// (#490). Published through `record_config_change` in the payroll
+/// contract's `config_audit` module.
+///
+/// ```text
+/// topics = ( Symbol("payroll"), Symbol("config_changed"), Symbol(key) )
+/// data   = ( actor, subject_ref, previous_ref, new_ref, revision,
+///            ledger_sequence, timestamp )
+/// ```
+///
+/// Configuration values are never published in plaintext: `subject_ref`,
+/// `previous_ref`, and `new_ref` are `sha256` digests of the canonical XDR
+/// encoding of the subject and values, with an all-zero digest meaning
+/// "no subject" / "no value". See `docs/config-audit-events.md`.
+#[contractevent(topics = ["payroll", "config_changed"], data_format = "vec")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfigChanged {
+    /// Configuration setting that changed (e.g. `"capacity_limits"`).
+    #[topic]
+    pub key: Symbol,
+    /// Authenticated address that made the change.
+    pub actor: Address,
+    /// Digest of the asset, period, or role holder the setting is keyed by.
+    pub subject_ref: BytesN<32>,
+    /// Digest of the value before the change.
+    pub previous_ref: BytesN<32>,
+    /// Digest of the value after the change.
+    pub new_ref: BytesN<32>,
+    /// Contract-wide configuration revision after this change.
+    pub revision: u64,
+    /// Ledger sequence at which the change was applied.
+    pub ledger_sequence: u32,
+    /// Ledger timestamp at which the change was applied.
+    pub timestamp: u64,
+}
+
 // ?????????????????????????????????????????????????????????????????????????????
 // Payroll Registry Events
 // ?????????????????????????????????????????????????????????????????????????????
@@ -976,26 +1204,17 @@ pub fn emit_employee_status_changed(
     );
 }
 
-// ═════════════════════════════════════════════════════════════════════════
-// Payroll Period Freeze Events (#471)
-// ═════════════════════════════════════════════════════════════════════════
+// ── Issue: Versioned Admin Configuration Updates ─────────────────────────────
 
-/// Emitted when a payroll period is frozen (#471).
-///
-/// `reason` is a short operator-supplied label (e.g. `finalized` when the
-/// freeze was applied automatically by `submit_run_draft`). No salary values
-/// or per-employee data are ever included in this event.
-pub fn emit_period_frozen(e: &Env, period_label: Symbol, frozen_by: Address, reason: Symbol) {
+/// Emitted when the admin configuration version is updated.
+pub fn emit_registry_admin_config_version_updated(
+    e: &Env,
+    company_id: u64,
+    new_version: u64,
+    updated_by: Address,
+) {
     e.events().publish(
-        (payroll_topic(), Symbol::new(e, "period_frozen")),
-        (period_label, frozen_by, reason),
-    );
-}
-
-/// Emitted when a payroll period freeze is lifted (#471).
-pub fn emit_period_unfrozen(e: &Env, period_label: Symbol, unfrozen_by: Address) {
-    e.events().publish(
-        (payroll_topic(), Symbol::new(e, "period_unfrozen")),
-        (period_label, unfrozen_by),
+        (Symbol::new(e, "AdminConfigVersionUpdated"), company_id),
+        (new_version, updated_by),
     );
 }

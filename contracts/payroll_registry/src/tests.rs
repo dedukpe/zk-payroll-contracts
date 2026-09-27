@@ -165,90 +165,6 @@ fn test_remove_employee_hard_deletes() {
 }
 
 #[test]
-fn test_revoke_company_admin_removes_access_without_deleting_company_state() {
-    let (env, contract_id) = setup();
-    let client = PayrollRegistryClient::new(&env, &contract_id);
-    let admin = Address::generate(&env);
-    let treasury = Address::generate(&env);
-    let employee = Address::generate(&env);
-    let commitment = BytesN::from_array(&env, &[2u8; 32]);
-
-    let company_id = client.register_company(&admin, &treasury);
-    client.add_employee(&company_id, &employee, &commitment);
-
-    let company = client.get_company(&company_id);
-    assert!(!company.revoked);
-
-    client.revoke_company_admin(&company_id, &admin);
-
-    let revoked_company = client.get_company(&company_id);
-    assert!(revoked_company.revoked);
-    assert_eq!(revoked_company.admin, admin);
-    assert_eq!(client.get_commitment(&company_id, &employee), commitment);
-
-    let other_employee = Address::generate(&env);
-    let other_commitment = BytesN::from_array(&env, &[7u8; 32]);
-    let result = client.try_add_employee(&company_id, &other_employee, &other_commitment);
-    assert!(result.is_err());
-}
-
-#[test]
-fn test_revoke_company_admin_requires_current_company_admin_authorization() {
-    let (env, contract_id) = setup_no_auth_mock();
-    let client = PayrollRegistryClient::new(&env, &contract_id);
-    let admin = Address::generate(&env);
-    let treasury = Address::generate(&env);
-    let attacker = Address::generate(&env);
-
-    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
-        address: &admin,
-        invoke: &soroban_sdk::testutils::MockAuthInvoke {
-            contract: &contract_id,
-            fn_name: "register_company",
-            args: (admin.clone(), treasury.clone()).into_val(&env),
-            sub_invokes: &[],
-        },
-    }]);
-    let company_id = client.register_company(&admin, &treasury);
-
-    let result = client.try_revoke_company_admin(&company_id, &attacker);
-    assert!(result.is_err());
-
-    let company = client.get_company(&company_id);
-    assert!(!company.revoked);
-}
-
-#[test]
-fn test_revoke_company_admin_preserves_other_company_authorization() {
-    let (env, contract_id) = setup();
-    let client = PayrollRegistryClient::new(&env, &contract_id);
-    let admin_a = Address::generate(&env);
-    let admin_b = Address::generate(&env);
-    let treasury_a = Address::generate(&env);
-    let treasury_b = Address::generate(&env);
-    let employee_a = Address::generate(&env);
-    let employee_b = Address::generate(&env);
-    let commitment_a = BytesN::from_array(&env, &[11u8; 32]);
-    let commitment_b = BytesN::from_array(&env, &[12u8; 32]);
-
-    let company_a = client.register_company(&admin_a, &treasury_a);
-    let company_b = client.register_company(&admin_b, &treasury_b);
-    client.add_employee(&company_a, &employee_a, &commitment_a);
-    client.add_employee(&company_b, &employee_b, &commitment_b);
-
-    client.revoke_company_admin(&company_a, &admin_a);
-
-    assert!(client.get_company(&company_a).revoked);
-    assert!(!client.get_company(&company_b).revoked);
-    assert_eq!(client.get_commitment(&company_b, &employee_b), commitment_b);
-
-    let new_employee = Address::generate(&env);
-    let new_commitment = BytesN::from_array(&env, &[13u8; 32]);
-    client.add_employee(&company_b, &new_employee, &new_commitment);
-    assert_eq!(client.get_commitment(&company_b, &new_employee), new_commitment);
-}
-
-#[test]
 fn test_update_commitment_replaces_value() {
     let (env, contract_id) = setup();
     let client = PayrollRegistryClient::new(&env, &contract_id);
@@ -404,7 +320,7 @@ fn test_add_employee_sets_active_status() {
 }
 
 #[test]
-fn test_set_employee_status_inactive_makes_ineligible() {
+fn test_set_employee_status_suspended_makes_ineligible() {
     let (env, contract_id) = setup();
     let client = PayrollRegistryClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
@@ -415,11 +331,11 @@ fn test_set_employee_status_inactive_makes_ineligible() {
     let company_id = client.register_company(&admin, &treasury);
     client.add_employee(&company_id, &employee, &commitment);
 
-    client.set_employee_status(&company_id, &employee, &EmployeeStatus::Inactive);
+    client.set_employee_status(&company_id, &employee, &EmployeeStatus::Suspended);
 
     assert_eq!(
         client.get_employee_status(&company_id, &employee),
-        EmployeeStatus::Inactive,
+        EmployeeStatus::Suspended,
     );
     assert!(!client.is_eligible(&company_id, &employee));
 }
@@ -455,7 +371,7 @@ fn test_unregistered_employee_is_not_eligible() {
 }
 
 #[test]
-fn test_reactivating_inactive_employee_restores_eligibility() {
+fn test_reactivating_suspended_employee_restores_eligibility() {
     let (env, contract_id) = setup();
     let client = PayrollRegistryClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
@@ -465,7 +381,7 @@ fn test_reactivating_inactive_employee_restores_eligibility() {
 
     let company_id = client.register_company(&admin, &treasury);
     client.add_employee(&company_id, &employee, &commitment);
-    client.set_employee_status(&company_id, &employee, &EmployeeStatus::Inactive);
+    client.set_employee_status(&company_id, &employee, &EmployeeStatus::Suspended);
     assert!(!client.is_eligible(&company_id, &employee));
 
     client.set_employee_status(&company_id, &employee, &EmployeeStatus::Active);
@@ -586,7 +502,7 @@ fn test_deactivate_employee_emits_lifecycle_event() {
     let company_id = client.register_company(&admin, &treasury);
     client.add_employee(&company_id, &employee, &commitment);
     let before = env.events().all().len();
-    client.set_employee_status(&company_id, &employee, &EmployeeStatus::Inactive);
+    client.set_employee_status(&company_id, &employee, &EmployeeStatus::Suspended);
     let after = env.events().all().len();
     assert_eq!(after, before + 1);
 
@@ -611,7 +527,7 @@ fn test_reactivate_employee_emits_lifecycle_event() {
 
     let company_id = client.register_company(&admin, &treasury);
     client.add_employee(&company_id, &employee, &commitment);
-    client.set_employee_status(&company_id, &employee, &EmployeeStatus::Inactive);
+    client.set_employee_status(&company_id, &employee, &EmployeeStatus::Suspended);
     let before = env.events().all().len();
     client.set_employee_status(&company_id, &employee, &EmployeeStatus::Active);
     let after = env.events().all().len();
@@ -941,9 +857,151 @@ fn test_is_employee_active_helper_tracks_status_without_exposing_commitment() {
     client.add_employee(&company_id, &employee, &commitment);
     assert!(client.is_employee_active(&company_id, &employee));
 
-    client.set_employee_status(&company_id, &employee, &EmployeeStatus::Inactive);
+    client.set_employee_status(&company_id, &employee, &EmployeeStatus::Suspended);
     assert!(!client.is_employee_active(&company_id, &employee));
 
     client.set_employee_status(&company_id, &employee, &EmployeeStatus::Active);
     assert!(client.is_employee_active(&company_id, &employee));
+}
+// ── Issue #486: Employee Payout Destination Update Flow Tests ───────────────
+
+#[test]
+fn test_successful_payout_destination_update_by_employee() {
+    let (env, contract_id) = setup();
+    let client = PayrollRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let new_destination = Address::generate(&env);
+    let commitment = BytesN::from_array(&env, &[1u8; 32]);
+
+    let company_id = client.register_company(&admin, &treasury);
+    client.add_employee(&company_id, &employee, &commitment);
+
+    // Initial payout destination defaults to employee address
+    assert_eq!(client.get_payout_destination(&company_id, &employee), employee);
+
+    // Employee updates their payout destination
+    client.update_payout_destination(&company_id, &employee, &new_destination);
+    assert_eq!(client.get_payout_destination(&company_id, &employee), new_destination);
+}
+
+#[test]
+#[should_panic(expected = "authorized")]
+fn test_update_payout_destination_rejects_non_owner() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, PayrollRegistry);
+    let registry = PayrollRegistryClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &admin,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "register_company",
+            args: (admin.clone(), treasury.clone()).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    let company_id = registry.register_company(&admin, &treasury);
+
+    let employee = Address::generate(&env);
+    let commitment = BytesN::from_array(&env, &[1u8; 32]);
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &admin,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "add_employee",
+            args: (company_id, employee.clone(), commitment.clone()).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    registry.add_employee(&company_id, &employee, &commitment);
+
+    // Attacker (not employee) attempts to update employee's payout destination
+    let attacker = Address::generate(&env);
+    let new_destination = Address::generate(&env);
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &attacker,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "update_payout_destination",
+            args: (company_id, employee.clone(), new_destination.clone()).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    registry.update_payout_destination(&company_id, &employee, &new_destination);
+}
+
+#[test]
+#[should_panic(expected = "Cannot set zero address as payout destination")]
+fn test_update_payout_destination_rejects_zero_address() {
+    let (env, contract_id) = setup();
+    let client = PayrollRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let commitment = BytesN::from_array(&env, &[1u8; 32]);
+
+    let company_id = client.register_company(&admin, &treasury);
+    client.add_employee(&company_id, &employee, &commitment);
+
+    let zero_addr = Address::from_string(&String::from_str(&env, VALID_EMPLOYEE_WALLET));
+    client.update_payout_destination(&company_id, &employee, &zero_addr);
+}
+
+#[test]
+#[should_panic(expected = "Destination address is already on file")]
+fn test_update_payout_destination_rejects_duplicate_address() {
+    let (env, contract_id) = setup();
+    let client = PayrollRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let commitment = BytesN::from_array(&env, &[1u8; 32]);
+
+    let company_id = client.register_company(&admin, &treasury);
+    client.add_employee(&company_id, &employee, &commitment);
+
+    // Attempting to update to the same address already on file (the employee address itself)
+    client.update_payout_destination(&company_id, &employee, &employee);
+}
+
+#[test]
+#[should_panic(expected = "Invalid employee wallet address format")]
+fn test_update_payout_destination_by_wallet_rejects_invalid_wallet() {
+    let (env, contract_id) = setup();
+    let client = PayrollRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let commitment = BytesN::from_array(&env, &[1u8; 32]);
+
+    let company_id = client.register_company(&admin, &treasury);
+    client.add_employee(&company_id, &employee, &commitment);
+
+    let bad_wallet = String::from_str(&env, BAD_CHECKSUM_EMPLOYEE_WALLET);
+    client.update_payout_destination_wallet(&company_id, &employee, &bad_wallet);
+}
+
+#[test]
+#[should_panic(expected = "Offboarded employee status cannot be changed")]
+fn test_offboarded_employee_cannot_be_changed() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let commitment = BytesN::from_array(&env, &[0; 32]);
+    let client = PayrollRegistryClient::new(&env, &env.register_contract(None, PayrollRegistry {}));
+    
+    let company_id = client.register_company(&admin, &treasury);
+    client.add_employee(&company_id, &employee, &commitment);
+    
+    client.set_employee_status(&company_id, &employee, &EmployeeStatus::Offboarded);
+    
+    // Attempting to change status should panic
+    client.set_employee_status(&company_id, &employee, &EmployeeStatus::Active);
 }

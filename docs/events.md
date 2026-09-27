@@ -68,6 +68,7 @@ data   = ( <payload> )
 | Treasury administration | [? Treasury Events](#treasury-events) | `payroll_registry`, `pause_manager` |
 | Audit & compliance | [? Audit Events](#audit-events) | `audit_module` |
 | ZK proof verification | [? Proof Events](#proof-events) | `proof_verifier` (cross-contract effects) |
+| Configuration audit | [Configuration Audit Events](#configuration-audit-events) | `payroll` |
 
 ---
 
@@ -461,68 +462,6 @@ data       (u64 draft_id, Symbol period_label, i128 total_amount, u32 employee_c
 | Severity | Consumers |
 |----------|-----------|
 | `LOW` | SDKs, dashboards, draft-review indexers |
-
-#### `payroll / period_frozen` (#471)
-
-Emitted when a payroll period is frozen — either manually by the admin via
-`freeze_payroll_period`, or automatically when `submit_run_draft` converts a
-draft into an executable run (in which case `reason` is `finalized`). After
-this event, all payroll edit paths for the period are blocked until the
-matching `period_unfrozen` event arrives.
-
-```
-topics[0]  Symbol("payroll")
-topics[1]  Symbol("period_frozen")
-data       (Symbol period_label, Address frozen_by, Symbol reason)
-```
-
-| Severity | Consumers |
-|----------|-----------|
-| `MEDIUM` | Payroll dashboards (disable edit affordances for the period), SDKs, compliance monitors |
-
-> Privacy: the payload carries only the period label, freezer identity, and a
-> short reason label. No salary values, commitments, or employee lists are
-> ever included.
-
-#### `payroll / period_unfrozen` (#471)
-
-Emitted when the admin lifts a period freeze via `unfreeze_payroll_period`
-(authorized correction flow). Treat this as an exceptional, audited action:
-indexers should surface it prominently, since edits become possible for the
-period again.
-
-```
-topics[0]  Symbol("payroll")
-topics[1]  Symbol("period_unfrozen")
-data       (Symbol period_label, Address unfrozen_by)
-```
-
-| Severity | Consumers |
-|----------|-----------|
-| `HIGH` | Compliance monitors (audit trail), SDKs, dashboards (re-enable edits) |
-
-#### `payroll / run_expired` (#474)
-
-Emitted when a prepared-but-unfinalized payroll run is expired via
-`expire_payroll_run` after its configured expiry window elapsed. The run's
-treasury funds reservation (#343) is released and nothing was executed. The
-expiry submission is permissionless — `expired_by` may be any observer, not
-necessarily the admin.
-
-```
-topics[0]  Symbol("payroll")
-topics[1]  Symbol("run_expired")
-data       (u64 run_id, Address expired_by)
-```
-
-| Severity | Consumers |
-|----------|-----------|
-| `MEDIUM` | Payroll dashboards (mark run terminal, release reservation badge), SDKs, treasury monitors |
-
-> Privacy: the payload carries only the run id and the submitting caller. No
-> amounts, employee addresses, commitments, or proof material are included;
-> the on-chain `ExpiredRunRecord` is redacted the same way.
-
 #### `payroll / deposit`
 
 ```
@@ -625,15 +564,19 @@ data       ()
 Compliance-grade events from `audit_module`. They carry only metadata ?
 salary values are NEVER emitted, consistent with the privacy boundary.
 
-### `ViewKeyGenerated` ? `audit_module`
+### `ViewKeyGenerated` — `audit_module`
 
-Emitted when a view key is generated for an auditor. Includes the raw key
-bytes (auditor-address-bound) and the ledger at which the key expires.
+Emitted when a view key is generated for an auditor. Carries only the
+ledger at which the key expires — the raw key bytes are returned directly
+to the caller from `generate_view_key` but are deliberately **not**
+included in the event, since publishing the key material itself in a
+public event would let anyone perform keyed-commitment checks without ever
+holding a genuine grant.
 
 ```
 topics[0]  Symbol("ViewKeyGenerated")
 topics[1]  Address auditor
-data       (BytesN<32> key_bytes, u32 expiration_ledger)
+data       (u32 expiration_ledger,)
 ```
 
 | Severity | Consumers |
@@ -652,17 +595,19 @@ data       (BytesN<32> key_bytes, u32 expiration_ledger)
 
 ---
 
-### `AuditAccessRevoked` ? `audit_module`
+### `AuditAccessRevoked` — `audit_module`
 
-Emitted when a view key is revoked before its expiration. Carries the
-revoking admin, the affected auditor, and the ledger timestamp at which
-the revocation occurred.
+Emitted when a view key is revoked before its expiration. The revoking
+admin and the affected auditor are both carried as topics; there is no
+data payload (only emitted on success — a rejected revocation attempt,
+e.g. wrong granter or unknown auditor, emits no event at all, so this
+event is always a reliable, non-ambiguous "access is now cut off" signal).
 
 ```
 topics[0]  Symbol("AuditAccessRevoked")
 topics[1]  Address admin       // the admin that originally granted the key
 topics[2]  Address auditor     // the auditor losing access
-data       (u64 timestamp,)    // env.ledger().timestamp() at revocation
+data       ()                  // no payload
 ```
 
 | Severity | Consumers |
@@ -771,6 +716,36 @@ Every `PayrollProcessed` event (? Payroll Events) is also an implicit
 
 ---
 
+## Configuration Audit Events
+
+### `payroll / config_changed` — `payroll`
+
+Emitted exactly once per successful configuration change (#490): admin,
+treasury owner, pause manager, asset allowlist, company state, capacity
+limits, settlement windows, period freezes, retention policy, reviewers,
+dispute authorities, reservation expiry policy, payroll currency, and storage
+version. No-op and failed changes emit nothing.
+
+```
+topics[0]  Symbol("payroll")
+topics[1]  Symbol("config_changed")
+topics[2]  Symbol     key               e.g. "capacity_limits", "reviewer", "admin"
+data       (Address actor, BytesN<32> subject_ref, BytesN<32> previous_ref,
+            BytesN<32> new_ref, u64 revision, u32 ledger_sequence, u64 timestamp)
+```
+
+Values are referenced by `sha256` of their canonical XDR, and 32 zero bytes
+mean "no value/subject". `revision` is contract-wide and gap-free, and
+`get_config_revision()` returns its latest value. See
+[config-audit-events.md](./config-audit-events.md) for the key table, how to
+verify a reference, and the privacy model.
+
+| Severity | Consumers |
+|----------|-----------|
+| `MEDIUM` (privileged configuration change) | Compliance auditors, security monitoring, admin dashboards, indexers |
+
+---
+
 ## Consumer Matrix
 
 Quick-reference: which consumer types should subscribe to which domain.
@@ -854,14 +829,15 @@ Quick-reference: which consumer types should subscribe to which domain.
 | `PeriodCreated` | `payment_executor` | `(company_id)` | `(period_id,)` |
 | `PeriodClosed` | `payment_executor` | `(company_id)` | `(period_id,)` |
 | `PayrollProcessed` | `payment_executor` | `(company_id)` | `(employee, amount, period_id)` |
-| `ViewKeyGenerated` | `audit_module` | `(auditor)` | `(key_bytes, expiration_ledger)` |
-| `AuditAccessRevoked` | `audit_module` | `(admin, auditor)` | `(timestamp,)` |
+| `ViewKeyGenerated` | `audit_module` | `(auditor)` | `(expiration_ledger,)` |
+| `AuditAccessRevoked` | `audit_module` | `(admin, auditor)` | `()` |
 | `AuditSuccessful` | `audit_module` | `(auditor)` | `(scope, keyed_stored)` |
 | `AggregateAuditGenerated` | `audit_module` | `(auditor)` | `(company_id, period_start, period_end)` |
 | `AuditSummaryExported` | `audit_module` | `(auditor)` | `(company_id, period_start, period_end, total)` |
 | `PauseManager / op_proposed` | `pause_manager` | `("PauseManager", "op_proposed")` | `(current_operator, new_operator)` |
 | `PauseManager / op_rotated` | `pause_manager` | `("PauseManager", "op_rotated")` | `Address new_operator` *(bare Address ? single-value data)* |
 | `PauseManager / op_cancelled` | `pause_manager` | `("PauseManager", "op_cancelled")` | `Address current_operator` *(bare Address ? single-value data)* |
+| `payroll / config_changed` | `payroll` | `("payroll", "config_changed", key)` | `(actor, subject_ref, previous_ref, new_ref, revision, ledger_sequence, timestamp)` |
 
 ---
 

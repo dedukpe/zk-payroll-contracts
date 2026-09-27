@@ -3,6 +3,21 @@
 This document describes how the ZK Payroll contract prevents duplicate payroll execution,
 protects against malicious replays, and ensures safe retry semantics for SDKs and dashboards.
 
+## Contract entrypoint
+
+Clients that need safe retry semantics should call
+batch_process_payroll_idempotent with a random, non-zero 32-byte
+idempotency_key. The first successful call stores the key, a hash of the
+complete request, and the resulting run_id. Repeating the exact request
+returns the original run_id without transferring funds again.
+
+The key is bound to every execution input (proofs, amounts, employees, expected
+total, nonce, and optional draft hash). Reusing a key with any changed input
+fails with "Idempotency key payload mismatch"; clients must use a new key for a
+new payroll request. Authorization and all existing payroll validation still
+run for a first submission, while a retry still requires the payroll admin's
+authorization.
+
 ## Problem Statement
 
 Without proper idempotency controls, payroll execution risks:

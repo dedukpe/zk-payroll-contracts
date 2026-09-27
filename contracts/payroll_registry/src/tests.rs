@@ -165,6 +165,90 @@ fn test_remove_employee_hard_deletes() {
 }
 
 #[test]
+fn test_revoke_company_admin_removes_access_without_deleting_company_state() {
+    let (env, contract_id) = setup();
+    let client = PayrollRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let commitment = BytesN::from_array(&env, &[2u8; 32]);
+
+    let company_id = client.register_company(&admin, &treasury);
+    client.add_employee(&company_id, &employee, &commitment);
+
+    let company = client.get_company(&company_id);
+    assert!(!company.revoked);
+
+    client.revoke_company_admin(&company_id, &admin);
+
+    let revoked_company = client.get_company(&company_id);
+    assert!(revoked_company.revoked);
+    assert_eq!(revoked_company.admin, admin);
+    assert_eq!(client.get_commitment(&company_id, &employee), commitment);
+
+    let other_employee = Address::generate(&env);
+    let other_commitment = BytesN::from_array(&env, &[7u8; 32]);
+    let result = client.try_add_employee(&company_id, &other_employee, &other_commitment);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_revoke_company_admin_requires_current_company_admin_authorization() {
+    let (env, contract_id) = setup_no_auth_mock();
+    let client = PayrollRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let attacker = Address::generate(&env);
+
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &admin,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "register_company",
+            args: (admin.clone(), treasury.clone()).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    let company_id = client.register_company(&admin, &treasury);
+
+    let result = client.try_revoke_company_admin(&company_id, &attacker);
+    assert!(result.is_err());
+
+    let company = client.get_company(&company_id);
+    assert!(!company.revoked);
+}
+
+#[test]
+fn test_revoke_company_admin_preserves_other_company_authorization() {
+    let (env, contract_id) = setup();
+    let client = PayrollRegistryClient::new(&env, &contract_id);
+    let admin_a = Address::generate(&env);
+    let admin_b = Address::generate(&env);
+    let treasury_a = Address::generate(&env);
+    let treasury_b = Address::generate(&env);
+    let employee_a = Address::generate(&env);
+    let employee_b = Address::generate(&env);
+    let commitment_a = BytesN::from_array(&env, &[11u8; 32]);
+    let commitment_b = BytesN::from_array(&env, &[12u8; 32]);
+
+    let company_a = client.register_company(&admin_a, &treasury_a);
+    let company_b = client.register_company(&admin_b, &treasury_b);
+    client.add_employee(&company_a, &employee_a, &commitment_a);
+    client.add_employee(&company_b, &employee_b, &commitment_b);
+
+    client.revoke_company_admin(&company_a, &admin_a);
+
+    assert!(client.get_company(&company_a).revoked);
+    assert!(!client.get_company(&company_b).revoked);
+    assert_eq!(client.get_commitment(&company_b, &employee_b), commitment_b);
+
+    let new_employee = Address::generate(&env);
+    let new_commitment = BytesN::from_array(&env, &[13u8; 32]);
+    client.add_employee(&company_b, &new_employee, &new_commitment);
+    assert_eq!(client.get_commitment(&company_b, &new_employee), new_commitment);
+}
+
+#[test]
 fn test_update_commitment_replaces_value() {
     let (env, contract_id) = setup();
     let client = PayrollRegistryClient::new(&env, &contract_id);

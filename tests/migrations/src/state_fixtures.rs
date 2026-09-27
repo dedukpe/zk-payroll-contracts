@@ -89,6 +89,7 @@ pub fn write_v1_company_fixture(
     let info = CompanyInfo {
         admin: admin.clone(),
         treasury: treasury.clone(),
+        revoked: false,
     };
 
     env.as_contract(registry_id, || {

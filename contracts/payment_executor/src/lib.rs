@@ -270,6 +270,9 @@ impl PaymentExecutor {
 
         let registry = PayrollRegistryClient::new(&env, &addresses.registry);
         let company: CompanyInfo = registry.get_company(&company_id);
+        if company.revoked {
+            panic!("Company admin is revoked");
+        }
         company.admin.require_auth();
 
         // Assign sequential period ID
@@ -327,6 +330,9 @@ impl PaymentExecutor {
 
         let registry = PayrollRegistryClient::new(&env, &addresses.registry);
         let company: CompanyInfo = registry.get_company(&company_id);
+        if company.revoked {
+            panic!("Company admin is revoked");
+        }
         company.admin.require_auth();
 
         let period_key = DataKey::Period(company_id, period_id);
@@ -430,6 +436,9 @@ impl PaymentExecutor {
         let company: CompanyInfo = registry.get_company(&company_id);
 
         // Ensure only HR admin for this company can trigger payroll and treasury authorizes payment.
+        if company.revoked {
+            panic!("Company admin is revoked");
+        }
         company.admin.require_auth();
         company.treasury.require_auth();
 

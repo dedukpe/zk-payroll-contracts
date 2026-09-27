@@ -318,6 +318,14 @@ pub fn emit_company_admin_rotation_cancelled(e: &Env, company_id: u64, caller: A
     );
 }
 
+/// Emitted when a company admin authorization is revoked.
+pub fn emit_company_admin_revoked(e: &Env, company_id: u64, admin: Address) {
+    e.events().publish(
+        (Symbol::new(e, "CompanyAdminRevoked"), company_id, admin),
+        (),
+    );
+}
+
 /// Emitted when a company treasury rotation is proposed.
 pub fn emit_company_treasury_proposed(
     e: &Env,

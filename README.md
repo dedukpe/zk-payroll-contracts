@@ -124,6 +124,12 @@ payroll_registry.add_employee(
 );
 ```
 
+### Employer Access Revocation
+
+An authorized company admin may revoke the company's employer/admin authorization without deleting the company record or historical payroll state. Revocation marks the company as revoked in the canonical registry state, removes the active employer mapping, and blocks subsequent employer-only actions such as employee onboarding, employee status updates, and payroll-period setup for that company.
+
+Existing payroll history remains intact; only the employer authorization is lifted. A revoked employer cannot call employer-only entrypoints until the canonical role state is restored through the repository's existing admin/rotation flows.
+
 ### Process Private Payroll
 
 ```rust
